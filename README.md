@@ -59,3 +59,23 @@ cargo run --release --example selftest -- <policy.onnx>   # 形状・レイテ�
 まだ無い検証: Rust コントローラを MuJoCo（misa-plant-mujoco）で閉ループに
 して Python の `sim2sim_mit_go2_mujoco.py --natural-walk` と突き合わせる
 比較。go2-runner 側の課題として残っている。
+
+## Pure contract (network-only)
+
+`pure::PureController` implements go2_rl `doc/mit_pure.md`: the runtime is
+obs → ONNX → affine decode, nothing else. No reference trajectory, no IK, no
+gait clock, no filter, no support-wrench feedforward.
+
+- 73 inputs = the 37-d base observation + the previous raw action (±100 clip,
+  zeros at reset).
+- 76 inputs = 73 + an estimated body-frame linear velocity, appended last.
+  `wants_velocity()` reports which form the loaded graph needs.
+- Decode: `q = crouch_default + 0.25·a_pos` (soft limits),
+  `Kp = clamp(45 + 12.5·a_kp, 10, 60)`, `Kd = clamp(2 + 0.5·a_kd, 0.5, 3.5)`.
+  `crouch_default = ik(trajectory(0,0))` at 0.30 m — the same stand the
+  Natural contract ramps into.
+- Command envelope (`clamp_pure_cmd`): vx ∈ [−0.16, 1.0], vy ±0.10,
+  wz ±0.40 — the trained range of the pure76 speed100 checkpoint.
+
+Hosts pick the contract by graph width; `go2-runner`'s `policy` subcommand
+does that automatically (39 → Natural, 73/76 → Pure).

@@ -32,9 +32,11 @@ pub mod go2;
 pub mod natural;
 pub mod obs;
 pub mod policy;
+pub mod pure;
 pub mod support;
 
 pub use controller::{decode_loco, NaturalController, PolicyTick};
+pub use pure::{clamp_pure_cmd, PureController};
 pub use natural::TrajectoryCfg;
 pub use obs::ObsInput;
 pub use policy::OnnxPolicy;
