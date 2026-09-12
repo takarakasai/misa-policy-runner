@@ -1,0 +1,33 @@
+# misa-policy-runner — 学習済み RL 歩行ポリシー（ONNX）の実行系。
+#
+# go2_rl（Isaac Lab）の MIT モード可変ゲイン方策を実機で走らせるための
+# デプロイ側実装。**ONNX 単体はコントローラではない**（doc/mit_natural.md）。
+# この crate が契約の全部を持つ:
+#
+#   - natural_walk の四拍歩容軌道 + 解析 IK / FK / ヤコビアン（Rust 移植、
+#     Python 版とゴールデンベクタで照合）
+#   - 39 次元観測の組み立て（Isaac 関節順、クロック sin/cos、妥当性スクリーン）
+#   - tract-onnx 推論（純 Rust — C 依存なしで Go2 の aarch64 に素直に乗る）
+#   - 行動デコード: q_ref = IK(軌道) + 0.035·tanh(a)、Kp/Kd 写像、30 ms 一次
+#     フィルタ、支持脚レンチのフィードフォワード τ_ff = −Jᵀf
+#
+# 機体への接続（Plant）と操縦は持たない。go2-runner がこの crate と
+# misa-runner を束ねる。
+[package]
+name = "misa-policy-runner"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+publish = false
+description = "Deploy-side runtime for the MIT-mode variable-gain RL locomotion policy (Isaac-MIT-Natural): four-beat reference trajectory, analytic IK/FK, 39-d observation assembly, tract-onnx inference, action decoding with the support-wrench feedforward."
+
+[dependencies]
+# 純 Rust の ONNX ランタイム。C 依存が無いので Go2 の aarch64 へそのまま
+# クロスコンパイルできる（go2-gait-runner の policy モードと同じ選定理由）。
+tract-onnx = "0.21"
+# 6×6 の正規方程式（支持脚レンチの最小二乗配分）に使う。バージョンは
+# misa-runner / quadruped-gait の pin と揃える。
+nalgebra = "0.34.2"
+
+[workspace]
