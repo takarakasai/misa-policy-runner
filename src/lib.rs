@@ -29,6 +29,8 @@
 
 pub mod controller;
 pub mod go2;
+pub mod namiashi;
+pub mod namiashi_ref;
 pub mod natural;
 pub mod obs;
 pub mod policy;
