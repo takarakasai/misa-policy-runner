@@ -11,10 +11,12 @@
 //!   appended last. On hardware this comes from leg odometry — it is a
 //!   sensor-style estimate fed to the network, not a controller.
 //!
-//! The verified 1 m/s checkpoint (2026-09-13,
-//! `go2_mit_pure_vel_speed/…_pure76_speed100_lr1e4`) is the 76 form:
-//! sim2sim 0.4 → 97%, 0.7 → 104%, 1.0 → 104% on the realistic-damping
-//! plant. Decode (Isaac order, `a = [a_pos|a_kp|a_kd]`):
+//! The RECOMMENDED checkpoint (2026-09-13,
+//! `go2_mit_pure_vel_rival/…_rival_wide_dr`) is the 76 form. On the
+//! Unitree-official plant (joint damping 0.1, foot friction 0.4) it tracks
+//! vx 0.3/0.6/1.0 at 97/100/100 %, vy 0.2 at 95 %, wz 0.8 at 73 %, and on
+//! the pessimistic damping-2 plant it still walks the whole range
+//! (67–84 %, no falls). Decode (Isaac order, `a = [a_pos|a_kp|a_kd]`):
 //!
 //! ```text
 //! q_ref = default_crouch + 0.25·a_pos      (soft joint limits)
@@ -46,13 +48,22 @@ pub const PURE_KD: GainMap = GainMap { g0: 2.0, scale: 0.5, min: 0.5, max: 3.5 }
 /// The last_action observation term's clip (Isaac `clip=(-100, 100)`).
 const LAST_ACTION_CLIP: f64 = 100.0;
 
-/// Trained command envelope of the pure76 speed100 checkpoint:
-/// vx ∈ [−0.16, 1.0], vy ∈ ±0.10, wz ∈ ±0.40 (its params/env.yaml).
+/// Trained command envelope of the RECOMMENDED pure76 checkpoint
+/// (`go2_mit_pure_vel_rival/2026-09-13_21-45-15_rival_wide_dr`):
+/// vx ∈ [−0.16, 1.0], vy ∈ ±0.30, wz ∈ ±0.80 (its params/env.yaml).
+///
+/// The envelope belongs to the CHECKPOINT, not to the contract, and the
+/// ONNX carries no metadata about it. Earlier pure76 checkpoints (the
+/// speed100 / deploy lines) were trained at vy ±0.10 / wz ±0.40 and at
+/// vx 0.30–0.45 respectively, so commands beyond those are out of
+/// distribution for them -- they will still run, just worse. Hosts that
+/// need a tighter bound can clamp again on their side (go2-runner's
+/// `--vx-max` does exactly that).
 pub fn clamp_pure_cmd(c: [f64; 3]) -> [f64; 3] {
     [
         c[0].clamp(-0.16, 1.0),
-        c[1].clamp(-0.10, 0.10),
-        c[2].clamp(-0.40, 0.40),
+        c[1].clamp(-0.30, 0.30),
+        c[2].clamp(-0.80, 0.80),
     ]
 }
 
@@ -220,7 +231,7 @@ mod tests {
     /// The command clamp is the trained envelope of the pure76 checkpoint.
     #[test]
     fn pure_cmd_envelope() {
-        assert_eq!(clamp_pure_cmd([2.0, 2.0, 2.0]), [1.0, 0.10, 0.40]);
-        assert_eq!(clamp_pure_cmd([-2.0, -2.0, -2.0]), [-0.16, -0.10, -0.40]);
+        assert_eq!(clamp_pure_cmd([2.0, 2.0, 2.0]), [1.0, 0.30, 0.80]);
+        assert_eq!(clamp_pure_cmd([-2.0, -2.0, -2.0]), [-0.16, -0.30, -0.80]);
     }
 }

@@ -74,8 +74,10 @@ gait clock, no filter, no support-wrench feedforward.
   `Kp = clamp(45 + 12.5·a_kp, 10, 60)`, `Kd = clamp(2 + 0.5·a_kd, 0.5, 3.5)`.
   `crouch_default = ik(trajectory(0,0))` at 0.30 m — the same stand the
   Natural contract ramps into.
-- Command envelope (`clamp_pure_cmd`): vx ∈ [−0.16, 1.0], vy ±0.10,
-  wz ±0.40 — the trained range of the pure76 speed100 checkpoint.
+- Command envelope (`clamp_pure_cmd`): vx ∈ [−0.16, 1.0], vy ±0.30,
+  wz ±0.80 — the trained range of the recommended pure76 checkpoint
+  (`rival_wide_dr`). The envelope belongs to the checkpoint, not the
+  contract; older pure76 checkpoints used vy ±0.10 / wz ±0.40.
 
 Hosts pick the contract by graph width; `go2-runner`'s `policy` subcommand
 does that automatically (39 → Natural, 73/76 → Pure).
