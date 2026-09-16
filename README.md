@@ -81,3 +81,17 @@ gait clock, no filter, no support-wrench feedforward.
 
 Hosts pick the contract by graph width; `go2-runner`'s `policy` subcommand
 does that automatically (39 → Natural, 73/76 → Pure).
+
+## namiashi contract (position-only)
+
+`namiashi::NamiashiRefController` implements the go2_rl namiashi WalkFlat
+contract (v12 analytic reference, v13/v14 Adapt MLP checkpoints): 47 inputs
+(gyro, projected gravity, cmd, q−default, dq, last action, gait clock
+sin/cos(2πt/0.32)), output = 12 joint position targets in Isaac type-major
+order. `q_des = trot_target(τ, cmd) + res(cmd)·tanh(a)` with the turn-gated
+residual 0.08 → 0.30 rad at |wz| 0.5. No gains, no torque — the LKM MG4005E
+position loop is the plant. Command envelope vx −0.15..0.35 / vy ±0.15 /
+wz ±0.40 (hosts should cap |wz| lower: pure turning at 0.2–0.4 falls in
+MuJoCo). `misa_to_isaac(i)` maps the misa leg order (FL,FR,RL,RR × h/t/c)
+to Isaac. Golden-tested against the Python reference (1e-7). Host: the
+`policy` subcommand of namiashi-runner2.

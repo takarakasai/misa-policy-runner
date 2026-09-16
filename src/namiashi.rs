@@ -1,30 +1,36 @@
-//! namiashi WalkFlatRef（v7）契約 — 参照 + 残差の低速歩行方策の実行系。
+//! namiashi WalkFlat 契約（v12 以降、v13 "Adapt" / v14 "AdaptV2" で学習した
+//! MLP が対象）— 参照 + 残差の全方位低速歩行方策の実行系。
 //!
-//! go2_rl `Isaac-Namiashi-WalkFlatRef-v0`（namiashi_rl/actions_ref.py）の
-//! デプロイ側。リファレンス実装は go2_rl `sim2sim_namiashi_ref_mujoco.py`
-//! （実測: MuJoCo で cmd 0.2 → 97%、0.3 → 98%、転倒なし）。
+//! go2_rl `Isaac-Namiashi-WalkFlatAdapt*-v0`（namiashi_rl/actions_ref.py、
+//! mdp_custom._trot_target_q）のデプロイ側。リファレンス実装は go2_rl
+//! `sim2sim_namiashi_ref_mujoco.py`（MuJoCo で前進 0.2 → 95–107%、kp 15–40 ×
+//! 遅延 0–15 ms で転倒なし）。
 //!
 //! - obs 47 = [gyro_b(3) | 重力射影_b(3) | cmd(3) | q−default(12) | dq(12)
 //!   | 前回生行動(12) | clock sin/cos(2πt/0.32)(2)]、生 SI・スケールなし。
 //!   関節順は **Isaac 型順**（hips|thighs|calves、脚内 FL,FR,RL,RR）。
-//! - デコード: q_des = trot_target(τ, cmd) + 0.08·tanh(a)。
-//!   **位置目標のみ** — MG4005E の内蔵位置ループに 50 Hz で送るだけで、
-//!   MIT モードは要らない（学習側の明示 PD kp25/kd0.5 はその近似）。
-//! - trot_target = 実録 Trot（[`namiashi_ref`]、0.879 m/s・0.32 s）の
-//!   足空間スケール: 平面ストライド ∝ |v_cmd|/0.879、リフトは移動中
-//!   50% を下限、停止指令では立位に退化。
+//! - デコード: q_des = trot_target(τ, cmd) + res(cmd)·tanh(a)。
+//!   res は旋回ゲート付き: 0.08 rad から |wz|/0.5 に比例して 0.30 rad まで
+//!   （v11 以降）。**位置目標のみ** — MG4005E の内蔵位置ループに 50 Hz で
+//!   送るだけで、MIT モードは要らない（学習側の明示 PD kp25/kd0.5 はその
+//!   近似。v13 以降はゲイン ×0.6–1.6・遅延 0–20 ms の DR で学習）。
+//! - trot_target は**完全解析**（v10 以降）: タイミング（duty、対角オフセット、
+//!   リフト）だけ実録 Trot から採寸し、ストライドは足ごとの指令速度
+//!   −(v + wz×r) から閉形式で引く。v12 で旋回指令に応じて duty 0.60→0.50 /
+//!   リフト 38→60 mm / ヨー利得 2→8 へ morph する。
 //!
 //! FK/IK は解析（関節原点は namiashi.misa から）。Python 実装とは
 //! ゴールデンベクタで照合（`tests/golden_namiashi.rs`）。
 
-use crate::namiashi_ref::{FEET_NOMINAL, FEET_REF, N_PHASE};
+use crate::namiashi_ref::FEET_NOMINAL;
 use crate::policy::OnnxPolicy;
 
-/// 実録 Trot の周期 [s] とその平面速度 [m/s]。
+/// 実録 Trot の周期 [s]（クロックと参照のタイミングの基準）。
 pub const PERIOD_S: f64 = 0.32;
-pub const REF_SPEED: f64 = 0.879;
-/// 残差の振幅 [rad]（tanh 有界）。
+/// 残差の基本振幅 [rad]（tanh 有界）と、旋回ゲートの最大振幅・基準 |wz|。
 pub const RESIDUAL_RAD: f64 = 0.08;
+pub const TURN_RESIDUAL_RAD: f64 = 0.30;
+pub const TURN_WZ_REF: f64 = 0.5;
 /// 学習時の明示 PD（実機では内蔵位置ループがこの近似の実体）。
 pub const KP: f64 = 25.0;
 pub const KD: f64 = 0.5;
@@ -32,9 +38,10 @@ pub const KD: f64 = 0.5;
 pub const DEFAULT_ISAAC: [f64; 12] = [
     0.0, 0.0, 0.0, 0.0, 0.695, 0.695, 0.695, 0.695, -1.390, -1.390, -1.390, -1.390,
 ];
-/// 学習時の指令包絡（v7: 前進のみ + 停止。後退・高 wz は分布外）。
-pub const CMD_VX_RANGE: (f64, f64) = (0.0, 0.35);
-pub const CMD_VY_RANGE: (f64, f64) = (-0.10, 0.10);
+/// 学習時の指令包絡（v12: 全方位。wz は ±0.4 で学習したが、MuJoCo では
+/// |wz| 0.4 の純旋回が転倒するので、運用の既定はホスト側でさらに絞る）。
+pub const CMD_VX_RANGE: (f64, f64) = (-0.15, 0.35);
+pub const CMD_VY_RANGE: (f64, f64) = (-0.15, 0.15);
 pub const CMD_WZ_RANGE: (f64, f64) = (-0.40, 0.40);
 
 pub const N_OBS: usize = 47;
@@ -48,11 +55,20 @@ const LINK: f64 = 0.1528;
 const SX: [f64; 4] = [1.0, 1.0, -1.0, -1.0];
 const SY: [f64; 4] = [1.0, -1.0, 1.0, -1.0];
 
+/// 参照歩容のタイミング（実録 Trot から採寸、v10）。
+const DIAG_OFFSETS: [f64; 4] = [0.89, 0.39, 0.39, 0.89];
+
 pub fn clamp_cmd(mut c: [f64; 3]) -> [f64; 3] {
     c[0] = c[0].clamp(CMD_VX_RANGE.0, CMD_VX_RANGE.1);
     c[1] = c[1].clamp(CMD_VY_RANGE.0, CMD_VY_RANGE.1);
     c[2] = c[2].clamp(CMD_WZ_RANGE.0, CMD_WZ_RANGE.1);
     c
+}
+
+/// 残差振幅 [rad]: 旋回指令で 0.08 → 0.30 に広がる（actions_ref.py と同数値）。
+pub fn residual_rad(cmd: [f64; 3]) -> f64 {
+    let wz_frac = (cmd[2].abs() / TURN_WZ_REF).clamp(0.0, 1.0);
+    RESIDUAL_RAD + wz_frac * (TURN_RESIDUAL_RAD - RESIDUAL_RAD)
 }
 
 /// 解析 FK: 関節角（Isaac 型順）→ 足先（胴体座標系）。
@@ -93,26 +109,36 @@ pub fn ik(feet: &[[f64; 3]; 4]) -> [f64; 12] {
     q
 }
 
-/// 参照関節角: 実録 Trot の足空間スケール（τ は周期単位、mod 1）。
+/// 参照関節角（v12 解析形）: τ は周期単位（mod 1 はここで取る）。
+///
+/// mdp_custom._trot_target_q / sim2sim_namiashi_ref_mujoco.py の trot_target
+/// と同数値（ゴールデンベクタ 1e-7）。停止指令では立位ぴったり。
 pub fn trot_target(tau: f64, cmd: [f64; 3]) -> [f64; 12] {
-    let f = tau.rem_euclid(1.0) * (N_PHASE - 1) as f64;
-    let i0 = f.floor() as usize;
-    let i1 = (i0 + 1).min(N_PHASE - 1);
-    let w = f - i0 as f64;
+    let tau = tau.rem_euclid(1.0);
     let planar = (cmd[0] * cmd[0] + cmd[1] * cmd[1]).sqrt();
-    let s = (planar / REF_SPEED).clamp(0.0, 1.0);
-    let moving = planar + 0.3 * cmd[2].abs() > 0.03;
-    let s_z = if moving { s.max(0.5) } else { 0.0 };
+    let yaw_c = 0.3 * cmd[2].abs();
+    let twist = planar + yaw_c;
+    let moving = if twist > 0.03 { 1.0 } else { 0.0 };
+    // 旋回歩容への morph（旋回の割合 turn_frac ∈ [0,1]）
+    let tf = if twist > 1e-3 { yaw_c / twist } else { 0.0 };
+    let duty = 0.60 - 0.10 * tf;
+    let lift_m = 0.038 + 0.022 * tf;
+    let yg = 2.0 + 6.0 * tf;
+    let scale = duty * PERIOD_S * moving;
+
     let mut feet = [[0.0f64; 3]; 4];
     for l in 0..4 {
-        for k in 0..3 {
-            let v = FEET_REF[i0][l][k] * (1.0 - w) + FEET_REF[i1][l][k] * w;
-            feet[l][k] = if k < 2 {
-                FEET_NOMINAL[l][k] + s * (v - FEET_NOMINAL[l][k])
-            } else {
-                FEET_NOMINAL[l][2] + s_z * (v - FEET_NOMINAL[l][2])
-            };
-        }
+        let phase = (tau + DIAG_OFFSETS[l]).rem_euclid(1.0);
+        let u = ((phase - duty) / (1.0 - duty)).clamp(0.0, 1.0);
+        let blend = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
+        let swing = phase >= duty;
+        let profile = if swing { blend - 0.5 } else { 0.5 - phase / duty };
+        let nom = FEET_NOMINAL[l];
+        let ux = cmd[0] - yg * cmd[2] * nom[1];
+        let uy = cmd[1] + yg * cmd[2] * nom[0];
+        let s = (std::f64::consts::PI * u).sin();
+        let lift = if swing { lift_m * s * s * moving } else { 0.0 };
+        feet[l] = [nom[0] + ux * profile * scale, nom[1] + uy * profile * scale, nom[2] + lift];
     }
     ik(&feet)
 }
@@ -123,7 +149,7 @@ pub struct NamiashiObsInput {
     /// 角速度 [rad/s]、胴体座標系（ジャイロ）。
     pub gyro_rad_s: [f64; 3],
     /// 重力射影（単位ベクトル、胴体座標系）。姿勢角から
-    /// `[−sinθ·…]` を組むか、[`gravity_from_rpy`] を使う。
+    /// [`gravity_from_rpy`] で組む。
     pub gravity_b: [f64; 3],
     pub joint_q_isaac: [f64; 12],
     pub joint_dq_isaac: [f64; 12],
@@ -137,7 +163,12 @@ pub fn gravity_from_rpy(rpy: [f64; 3]) -> [f64; 3] {
     [sp, -sr * cp, -cr * cp]
 }
 
-/// v7 コントローラ: クロック保持 + 観測組み立て + 推論 + デコード。
+/// misa の脚順（FL,FR,RL,RR × hip,thigh,calf）の軸 i → Isaac 型順の添字。
+pub fn misa_to_isaac(i: usize) -> usize {
+    (i % 3) * 4 + i / 3
+}
+
+/// コントローラ: クロック保持 + 観測組み立て + 推論 + デコード。
 /// 50 Hz で [`Self::tick`] を呼び、返る q_des（Isaac 型順）を位置目標として
 /// 送る。ゲインは固定（実機は内蔵位置ループ）。
 pub struct NamiashiRefController {
@@ -151,7 +182,7 @@ impl NamiashiRefController {
     pub fn new(policy: OnnxPolicy) -> Result<Self, String> {
         if policy.n_obs() != N_OBS {
             return Err(format!(
-                "v7 契約は {N_OBS} 入力（このグラフは {}）",
+                "namiashi 契約は {N_OBS} 入力（このグラフは {}）— 履歴学生や教師の ONNX は載らない",
                 policy.n_obs()
             ));
         }
@@ -213,10 +244,11 @@ impl NamiashiRefController {
 
         let a12 = self.policy.infer_n(&obs, N_ACT)?;
         let reference = trot_target(tau, cmd);
+        let res = residual_rad(cmd);
         let mut q = [0.0f64; 12];
         for i in 0..12 {
             self.last_action[i] = a12[i];
-            q[i] = reference[i] + RESIDUAL_RAD * a12[i].tanh();
+            q[i] = reference[i] + res * a12[i].tanh();
         }
         self.held = q;
         self.t += 1.0 / 50.0;
@@ -227,8 +259,9 @@ impl NamiashiRefController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namiashi_ref::{FEET_REF, N_PHASE};
 
-    /// FK(IK(feet)) の往復（参照テーブル全 48 位相）。
+    /// FK(IK(feet)) の往復（実録参照テーブル全 48 位相）。
     #[test]
     fn fk_inverts_ik_over_the_reference() {
         for i in 0..N_PHASE {
@@ -245,13 +278,34 @@ mod tests {
         }
     }
 
-    /// 停止指令 → 参照は立位ぴったり。
+    /// 立位の FK が埋め込みの公称足先と一致（参照生成の基準）。
+    #[test]
+    fn nominal_feet_are_fk_of_the_stance() {
+        let feet = fk(&DEFAULT_ISAAC);
+        for l in 0..4 {
+            for k in 0..3 {
+                assert!((feet[l][k] - FEET_NOMINAL[l][k]).abs() < 1e-9, "leg {l} axis {k}");
+            }
+        }
+    }
+
+    /// 停止指令 → 参照は立位ぴったり（位相によらず）。
     #[test]
     fn standing_reference_is_stance() {
-        let q = trot_target(0.37, [0.0; 3]);
-        for i in 0..12 {
-            assert!((q[i] - DEFAULT_ISAAC[i]).abs() < 1e-6, "q[{i}] = {}", q[i]);
+        for tau in [0.0, 0.37, 0.71, 1.9] {
+            let q = trot_target(tau, [0.0; 3]);
+            for i in 0..12 {
+                assert!((q[i] - DEFAULT_ISAAC[i]).abs() < 1e-6, "tau {tau} q[{i}] = {}", q[i]);
+            }
         }
+    }
+
+    /// 旋回ゲート: wz 0 で 0.08、wz 0.5 以上で 0.30、その間は線形。
+    #[test]
+    fn residual_gate_follows_the_training_rule() {
+        assert!((residual_rad([0.2, 0.0, 0.0]) - 0.08).abs() < 1e-12);
+        assert!((residual_rad([0.0, 0.0, 0.25]) - 0.19).abs() < 1e-12);
+        assert!((residual_rad([0.0, 0.0, -0.9]) - 0.30).abs() < 1e-12);
     }
 
     /// 重力射影: 水平で (0,0,−1)、前傾 90° で (1,0,0)。
@@ -261,5 +315,18 @@ mod tests {
         assert!((g[0]).abs() < 1e-12 && (g[1]).abs() < 1e-12 && (g[2] + 1.0).abs() < 1e-12);
         let g = gravity_from_rpy([0.0, std::f64::consts::FRAC_PI_2, 0.0]);
         assert!((g[0] - 1.0).abs() < 1e-9, "{g:?}");
+    }
+
+    /// misa 脚順 → Isaac 型順の並べ替えは全単射。
+    #[test]
+    fn misa_to_isaac_is_a_permutation() {
+        let mut seen = [false; 12];
+        for i in 0..12 {
+            seen[misa_to_isaac(i)] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+        assert_eq!(misa_to_isaac(0), 0); // FL hip
+        assert_eq!(misa_to_isaac(1), 4); // FL thigh
+        assert_eq!(misa_to_isaac(5), 9); // FR calf
     }
 }
