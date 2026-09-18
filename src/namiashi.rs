@@ -16,8 +16,16 @@
 //!   近似。v13 以降はゲイン ×0.6–1.6・遅延 0–20 ms の DR で学習）。
 //! - trot_target は**完全解析**（v10 以降）: タイミング（duty、対角オフセット、
 //!   リフト）だけ実録 Trot から採寸し、ストライドは足ごとの指令速度
-//!   −(v + wz×r) から閉形式で引く。v12 で旋回指令に応じて duty 0.60→0.50 /
-//!   リフト 38→60 mm / ヨー利得 2→8 へ morph する。
+//!   −(v + wz×r) から閉形式で引く。
+//! - **歩容の形は契約世代で違う（[`RefGaitCfg`]）**: v12 は旋回指令で
+//!   duty 0.60→0.50 / リフト 38→60 mm / ヨー利得 2→8 へ morph + 残差ゲート
+//!   0.08→0.30。**v15 はヨー計測の ±π 巻き付き発覚後の再較正**（go2_rl
+//!   doc/namiashi_policy_architecture.md §6）: morph 無し・一様 yg 1.25・
+//!   一様残差 0.08。v15 のデプロイ標準は
+//!   `2026-09-19_00-32-14_v15_seedcal/exported/policy_1899.onnx`
+//!   （純旋回 Isaac 104% / MuJoCo 108–113%、決定論リセット 0）。
+//!   **ONNX の入力幅は両世代とも 47 なので自動判別できない** — ホストが
+//!   チェックポイントに合わせて選ぶ（間違えると歩く。悪く。エラーは出ない）。
 //!
 //! FK/IK は解析（関節原点は namiashi.misa から）。Python 実装とは
 //! ゴールデンベクタで照合（`tests/golden_namiashi.rs`）。
@@ -57,6 +65,43 @@ const SY: [f64; 4] = [1.0, -1.0, 1.0, -1.0];
 
 /// 参照歩容のタイミング（実録 Trot から採寸、v10）。
 const DIAG_OFFSETS: [f64; 4] = [0.89, 0.39, 0.39, 0.89];
+
+/// 参照歩容と残差の契約世代パラメータ。学習時の設定と**一致必須**。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RefGaitCfg {
+    /// 歩行側のヨー・ストライド利得（turn_frac = 0 の端）。
+    pub yg_walk: f64,
+    /// 旋回側のヨー・ストライド利得（turn_frac = 1 の端）。
+    pub yg_turn: f64,
+    /// 旋回側の duty（歩行側は 0.60 固定）。
+    pub turn_duty: f64,
+    /// 旋回側の遊脚リフト [m]（歩行側は 0.038 固定）。
+    pub turn_lift_m: f64,
+    /// 残差振幅 [rad]（wz = 0 の端）。
+    pub residual_rad: f64,
+    /// |wz| = [`TURN_WZ_REF`] での残差振幅 [rad]。
+    pub turn_residual_rad: f64,
+}
+
+impl RefGaitCfg {
+    /// v12〜v14 のチェックポイント（旋回モーフ + 残差ゲート）。
+    pub fn v12() -> Self {
+        Self { yg_walk: 2.0, yg_turn: 8.0, turn_duty: 0.50, turn_lift_m: 0.060,
+               residual_rad: RESIDUAL_RAD, turn_residual_rad: TURN_RESIDUAL_RAD }
+    }
+
+    /// v15（種較正）: morph 無し・一様 yg 1.25・一様残差 0.08。
+    pub fn v15() -> Self {
+        Self { yg_walk: 1.25, yg_turn: 1.25, turn_duty: 0.60, turn_lift_m: 0.038,
+               residual_rad: RESIDUAL_RAD, turn_residual_rad: RESIDUAL_RAD }
+    }
+
+    /// 残差振幅 [rad]: wz でゲート（両端が同値なら定数）。
+    pub fn residual_rad(&self, cmd: [f64; 3]) -> f64 {
+        let wz_frac = (cmd[2].abs() / TURN_WZ_REF).clamp(0.0, 1.0);
+        self.residual_rad + wz_frac * (self.turn_residual_rad - self.residual_rad)
+    }
+}
 
 pub fn clamp_cmd(mut c: [f64; 3]) -> [f64; 3] {
     c[0] = c[0].clamp(CMD_VX_RANGE.0, CMD_VX_RANGE.1);
@@ -114,16 +159,21 @@ pub fn ik(feet: &[[f64; 3]; 4]) -> [f64; 12] {
 /// mdp_custom._trot_target_q / sim2sim_namiashi_ref_mujoco.py の trot_target
 /// と同数値（ゴールデンベクタ 1e-7）。停止指令では立位ぴったり。
 pub fn trot_target(tau: f64, cmd: [f64; 3]) -> [f64; 12] {
+    trot_target_cfg(tau, cmd, &RefGaitCfg::v12())
+}
+
+/// 参照関節角（契約世代パラメータ付き）。v15 は [`RefGaitCfg::v15`]。
+pub fn trot_target_cfg(tau: f64, cmd: [f64; 3], g: &RefGaitCfg) -> [f64; 12] {
     let tau = tau.rem_euclid(1.0);
     let planar = (cmd[0] * cmd[0] + cmd[1] * cmd[1]).sqrt();
     let yaw_c = 0.3 * cmd[2].abs();
     let twist = planar + yaw_c;
     let moving = if twist > 0.03 { 1.0 } else { 0.0 };
-    // 旋回歩容への morph（旋回の割合 turn_frac ∈ [0,1]）
+    // 旋回歩容への morph（旋回の割合 turn_frac ∈ [0,1]。v15 は両端同値 = 無効）
     let tf = if twist > 1e-3 { yaw_c / twist } else { 0.0 };
-    let duty = 0.60 - 0.10 * tf;
-    let lift_m = 0.038 + 0.022 * tf;
-    let yg = 2.0 + 6.0 * tf;
+    let duty = 0.60 - (0.60 - g.turn_duty) * tf;
+    let lift_m = 0.038 + (g.turn_lift_m - 0.038) * tf;
+    let yg = g.yg_walk + (g.yg_turn - g.yg_walk) * tf;
     let scale = duty * PERIOD_S * moving;
 
     let mut feet = [[0.0f64; 3]; 4];
@@ -173,13 +223,16 @@ pub fn misa_to_isaac(i: usize) -> usize {
 /// 送る。ゲインは固定（実機は内蔵位置ループ）。
 pub struct NamiashiRefController {
     policy: OnnxPolicy,
+    gait: RefGaitCfg,
     t: f64,
     last_action: [f64; 12],
     held: [f64; 12],
 }
 
 impl NamiashiRefController {
-    pub fn new(policy: OnnxPolicy) -> Result<Self, String> {
+    /// `gait` はチェックポイントの世代に合わせる（[`RefGaitCfg::v15`] が
+    /// デプロイ標準、v12〜v14 の ONNX には [`RefGaitCfg::v12`]）。
+    pub fn new(policy: OnnxPolicy, gait: RefGaitCfg) -> Result<Self, String> {
         if policy.n_obs() != N_OBS {
             return Err(format!(
                 "namiashi 契約は {N_OBS} 入力（このグラフは {}）— 履歴学生や教師の ONNX は載らない",
@@ -188,6 +241,7 @@ impl NamiashiRefController {
         }
         Ok(Self {
             policy,
+            gait,
             t: 0.0,
             last_action: [0.0; 12],
             held: DEFAULT_ISAAC,
@@ -243,8 +297,8 @@ impl NamiashiRefController {
         obs.push(ang.cos() as f32);
 
         let a12 = self.policy.infer_n(&obs, N_ACT)?;
-        let reference = trot_target(tau, cmd);
-        let res = residual_rad(cmd);
+        let reference = trot_target_cfg(tau, cmd, &self.gait);
+        let res = self.gait.residual_rad(cmd);
         let mut q = [0.0f64; 12];
         for i in 0..12 {
             self.last_action[i] = a12[i];
