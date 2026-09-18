@@ -131,3 +131,29 @@ fn trot_target_v15_matches_the_python_reference() {
         }
     }
 }
+
+/// v16（v15 + 前進のみ sg 1.4）の Python 照合。後退ケースは v15 と同値に
+/// なる（sg_fwd は vx > 0 にしか掛からない）— それが裏取り。
+#[test]
+fn trot_target_v16_matches_the_python_reference() {
+    use misa_policy_runner::namiashi::{trot_target_cfg, RefGaitCfg};
+    let g = RefGaitCfg::v16();
+    let cases = [
+        Golden { tau: 0.33, cmd: [0.2, 0.0, 0.0],
+            q: [0.0, 0.0, 0.0, 0.0, 0.663911278, 0.896483517, 0.896483517, 0.663911278, -1.388881333, -1.620764113, -1.620764113, -1.388881333] },
+        Golden { tau: 0.92, cmd: [0.2, 0.0, 0.2],
+            q: [0.001676019, -0.000500988, 0.000500988, -0.001676019, 0.858346980, 0.698986592, 0.698246424, 0.855833585, -1.739737147, -1.389596147, -1.389602958, -1.739683571] },
+        Golden { tau: 0.48, cmd: [-0.12, 0.0, 0.0],
+            q: [0.0, 0.0, 0.0, 0.0, 0.683469772, 0.859327138, 0.859327138, 0.683469772, -1.389842701, -1.651411841, -1.651411841, -1.389842701] },
+    ];
+    for (n, c) in cases.iter().enumerate() {
+        let q = trot_target_cfg(c.tau, c.cmd, &g);
+        for i in 0..12 {
+            assert!(
+                (q[i] - c.q[i]).abs() < 1e-7,
+                "case {n} (tau={}, cmd={:?}) q[{i}]: {} vs python {}",
+                c.tau, c.cmd, q[i], c.q[i]
+            );
+        }
+    }
+}

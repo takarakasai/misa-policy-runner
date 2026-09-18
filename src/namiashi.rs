@@ -81,19 +81,30 @@ pub struct RefGaitCfg {
     pub residual_rad: f64,
     /// |wz| = [`TURN_WZ_REF`] での残差振幅 [rad]。
     pub turn_residual_rad: f64,
+    /// 前進（vx > 0）だけのストライド較正利得（v16。後退・vy には掛けない —
+    /// open-loop 実測で前進 50% / 後退 123% の非対称のため）。
+    pub sg_fwd: f64,
 }
 
 impl RefGaitCfg {
     /// v12〜v14 のチェックポイント（旋回モーフ + 残差ゲート）。
     pub fn v12() -> Self {
         Self { yg_walk: 2.0, yg_turn: 8.0, turn_duty: 0.50, turn_lift_m: 0.060,
-               residual_rad: RESIDUAL_RAD, turn_residual_rad: TURN_RESIDUAL_RAD }
+               residual_rad: RESIDUAL_RAD, turn_residual_rad: TURN_RESIDUAL_RAD, sg_fwd: 1.0 }
     }
 
     /// v15（種較正）: morph 無し・一様 yg 1.25・一様残差 0.08。
     pub fn v15() -> Self {
         Self { yg_walk: 1.25, yg_turn: 1.25, turn_duty: 0.60, turn_lift_m: 0.038,
-               residual_rad: RESIDUAL_RAD, turn_residual_rad: RESIDUAL_RAD }
+               residual_rad: RESIDUAL_RAD, turn_residual_rad: RESIDUAL_RAD, sg_fwd: 1.0 }
+    }
+
+    /// v16（前進ストライド較正）: v15 + 前進のみ sg 1.4。デプロイ標準 =
+    /// `2026-09-19_01-11-02_v16_sgfwd/exported/policy_4598.onnx`
+    /// （MuJoCo 前進 99–107% / 後退 75% / 旋回 105–108% / 複合 vx 109%・
+    /// ヨー 102%、Isaac 決定論リセット 1/48）。
+    pub fn v16() -> Self {
+        Self { sg_fwd: 1.4, ..Self::v15() }
     }
 
     /// 残差振幅 [rad]: wz でゲート（両端が同値なら定数）。
@@ -184,7 +195,8 @@ pub fn trot_target_cfg(tau: f64, cmd: [f64; 3], g: &RefGaitCfg) -> [f64; 12] {
         let swing = phase >= duty;
         let profile = if swing { blend - 0.5 } else { 0.5 - phase / duty };
         let nom = FEET_NOMINAL[l];
-        let ux = cmd[0] - yg * cmd[2] * nom[1];
+        let sgx = if cmd[0] > 0.0 { g.sg_fwd } else { 1.0 };
+        let ux = sgx * cmd[0] - yg * cmd[2] * nom[1];
         let uy = cmd[1] + yg * cmd[2] * nom[0];
         let s = (std::f64::consts::PI * u).sin();
         let lift = if swing { lift_m * s * s * moving } else { 0.0 };
