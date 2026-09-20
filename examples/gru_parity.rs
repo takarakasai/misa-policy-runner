@@ -15,6 +15,11 @@
 //! With `--host-velocity` the estimator is skipped and three more columns
 //! (the body-frame velocity) are read from each line.
 //!
+//! 実機（Go2 の SBC = aarch64）で走らせるときは
+//! `scripts/build_aarch64.sh --example gru_parity` — clang をクロス
+//! アセンブラに、musl の self-contained crt を使うので **sudo もクロス gcc も
+//! 要らず、出来上がりは静的リンク**（SBC 側に何も入れなくてよい）。
+//!
 //! `rust.txt`: one tick per line —
 //! `obs(76) action_raw(36) hidden_out(128)`. The Python side
 //! (`go2-runner/scripts/gru_parity_reference.py`) writes the same layout
