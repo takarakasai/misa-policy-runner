@@ -29,6 +29,7 @@
 
 pub mod controller;
 pub mod go2;
+pub mod gru;
 pub mod namiashi;
 pub mod namiashi_ref;
 pub mod natural;
@@ -38,8 +39,9 @@ pub mod pure;
 pub mod support;
 
 pub use controller::{decode_loco, NaturalController, PolicyTick};
+pub use gru::{clamp_gru_cmd, HistoryVelocityEstimator, PureGruController, VelocitySource};
 pub use pure::{clamp_pure_cmd, PureController};
 pub use natural::TrajectoryCfg;
 pub use obs::ObsInput;
-pub use policy::OnnxPolicy;
+pub use policy::{graph_input_arity, OnnxPolicy, RecurrentOnnxPolicy};
 pub use support::BaseState;
