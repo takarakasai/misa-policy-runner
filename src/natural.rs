@@ -60,6 +60,13 @@ pub struct TrajectoryCfg {
     pub support_shift_gain: f64,
 }
 
+/// Lowest body height the h30 checkpoint was measured at (go2_rl
+/// `doc/push_robustness.md` §7.4). Below this the speed envelope breaks down:
+/// at 0.20 m, forward 0.24 m/s tracks 75% and a combined command 48%.
+pub const MIN_BODY_HEIGHT: f64 = 0.21;
+/// Highest measured body height (the `low05` variant's 0.31 m).
+pub const MAX_BODY_HEIGHT: f64 = 0.31;
+
 impl TrajectoryCfg {
     /// The STANDARD deploy checkpoint's configuration
     /// (`Isaac-MIT-NaturalH30-Go2-v0`: gains 1.55 / 2.0, height 0.30 m).
@@ -70,6 +77,44 @@ impl TrajectoryCfg {
             body_height: Some(0.30),
             support_shift_gain: 1.0,
         }
+    }
+
+    /// Yaw stride gain calibrated for `height`.
+    ///
+    /// The h30 gain 2.0 is calibrated at 0.30 m. Crouching makes the SAME
+    /// policy over-track yaw (133% of a 0.4 rad/s command at 0.21 m) because
+    /// the per-foot yaw stride is applied at a shorter leg. The error is in
+    /// the host-side reference, not the network, so it is fixed here rather
+    /// than by retraining. Measured 103–108% across 0.21–0.30 m
+    /// (go2_rl `doc/push_robustness.md` §7.2).
+    pub fn yaw_gain_for_height(height: f64) -> f64 {
+        2.0 + 4.444 * (height - 0.30)
+    }
+
+    /// This config at a different body height, with the yaw gain recalibrated.
+    ///
+    /// `height` is clamped to the measured range [`MIN_BODY_HEIGHT`,
+    /// `MAX_BODY_HEIGHT`]; `stride_gain` is unchanged (measured flat over the
+    /// range). The policy itself is height-agnostic — the height enters only
+    /// through this reference trajectory — so the SAME ONNX covers the range.
+    pub fn with_height(self, height: f64) -> Self {
+        let h = height.clamp(MIN_BODY_HEIGHT, MAX_BODY_HEIGHT);
+        Self {
+            body_height: Some(h),
+            yaw_stride_gain: Some(Self::yaw_gain_for_height(h)),
+            ..self
+        }
+    }
+
+    /// The low-stance deploy configuration: 0.22 m, yaw gain 1.644.
+    ///
+    /// Same ONNX and same `stride_gain` as [`Self::h30_standard`]. Standing
+    /// push survival rises 11% → 60% and the tolerated force from 0.37 to
+    /// 0.54–0.80 × body weight; tracking inside the trained envelope
+    /// (|vx| ≤ 0.16 m/s) is equal or better. The cost is 8 cm of belly
+    /// clearance, so the choice is a mission decision, not a default.
+    pub fn h30_low_stance() -> Self {
+        Self::h30_standard().with_height(0.22)
     }
 }
 
@@ -289,6 +334,56 @@ mod tests {
             let t = 1.5 + i as f64 * 0.02;
             let r = trajectory(t, [0.12, 0.0, 0.0], &cfg);
             assert!(r.swing.iter().filter(|s| **s).count() <= 1, "t={t}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod height_tests {
+    use super::*;
+
+    /// The schedule reproduces the two calibration points it was fitted to,
+    /// and the standard config is unchanged.
+    #[test]
+    fn yaw_gain_schedule_matches_calibration() {
+        assert!((TrajectoryCfg::yaw_gain_for_height(0.30) - 2.0).abs() < 1e-12);
+        assert!((TrajectoryCfg::yaw_gain_for_height(0.21) - 1.6).abs() < 2e-3);
+        let std = TrajectoryCfg::h30_standard();
+        assert_eq!(std.with_height(0.30), std);
+    }
+
+    /// The low-stance config is the standard one at 0.22 m with the
+    /// recalibrated yaw gain, everything else identical.
+    #[test]
+    fn low_stance_is_standard_at_022() {
+        let low = TrajectoryCfg::h30_low_stance();
+        let std = TrajectoryCfg::h30_standard();
+        assert_eq!(low.body_height, Some(0.22));
+        assert!((low.yaw_stride_gain.unwrap() - 1.644).abs() < 1e-3);
+        assert_eq!(low.stride_gain, std.stride_gain);
+        assert_eq!(low.support_shift_gain, std.support_shift_gain);
+    }
+
+    /// Heights outside the measured range are clamped, not extrapolated.
+    #[test]
+    fn height_is_clamped_to_the_measured_range() {
+        assert_eq!(
+            TrajectoryCfg::h30_standard().with_height(0.05).body_height,
+            Some(MIN_BODY_HEIGHT)
+        );
+        assert_eq!(
+            TrajectoryCfg::h30_standard().with_height(0.50).body_height,
+            Some(MAX_BODY_HEIGHT)
+        );
+    }
+
+    /// Standing at the low stance puts every foot at the commanded depth.
+    #[test]
+    fn low_stance_standing_reference_is_at_the_commanded_height() {
+        let r = trajectory(0.0, [0.0; 3], &TrajectoryCfg::h30_low_stance());
+        assert!((r.height - 0.22).abs() < 1e-12);
+        for l in 0..4 {
+            assert!((r.feet[l][2] - (0.023 - 0.22)).abs() < 1e-12);
         }
     }
 }
