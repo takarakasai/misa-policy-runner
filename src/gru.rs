@@ -90,6 +90,39 @@ fn rolled(
     f
 }
 
+const JOINT_MIRROR: [usize; 12] = [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10];
+
+fn reflect_action(action: &[f64]) -> [f64; N_ACT] {
+    let mut out = [0.0; N_ACT];
+    for block in 0..3 {
+        for i in 0..12 {
+            let sign = if block == 0 && i < 4 { -1.0 } else { 1.0 };
+            out[block * 12 + i] = sign * action[block * 12 + JOINT_MIRROR[i]];
+        }
+    }
+    out
+}
+
+fn reflect_observation(obs: &[f32]) -> Vec<f32> {
+    let mut out = obs.to_vec();
+    for &i in &[1, 2, 4, 6, 7, 9, 11, 74] {
+        out[i] = -obs[i];
+    }
+    for &offset in &[13, 25] {
+        for i in 0..12 {
+            let sign = if i < 4 { -1.0 } else { 1.0 };
+            out[offset + i] = sign * obs[offset + JOINT_MIRROR[i]];
+        }
+    }
+    for block in 0..3 {
+        for i in 0..12 {
+            let sign = if block == 0 && i < 4 { -1.0 } else { 1.0 };
+            out[37 + block * 12 + i] = sign * obs[37 + block * 12 + JOINT_MIRROR[i]];
+        }
+    }
+    out
+}
+
 /// The frozen six-frame body-velocity estimator (438 → 3). Normalization is
 /// folded into the exported graph, so the input is raw SI observation
 /// frames.
@@ -147,6 +180,9 @@ pub struct PureGruController {
     last_action: [f64; N_ACT],
     /// The recurrent state carried across ticks; zeros at reset.
     hidden: Vec<f32>,
+    reflected_hidden: Vec<f32>,
+    symmetric_calf_weight: f64,
+    policy_vx_gain: f64,
     q_hold: [f64; 12],
     kp_hold: [f64; 12],
     kd_hold: [f64; 12],
@@ -186,6 +222,9 @@ impl PureGruController {
             default_isaac,
             last_action: [0.0; N_ACT],
             hidden: vec![0.0; N_HIDDEN_GRU],
+            reflected_hidden: vec![0.0; N_HIDDEN_GRU],
+            symmetric_calf_weight: 0.0,
+            policy_vx_gain: 1.0,
             q_hold: default_isaac,
             kp_hold: [PURE_KP.g0; 12],
             kd_hold: [PURE_KD.g0; 12],
@@ -193,6 +232,21 @@ impl PureGruController {
             last_obs: Vec::new(),
             t: 0.0,
         })
+    }
+
+    /// Diagnostic only: average the four calf-position raw actions with an
+    /// independently recurrent mirrored actor. The executed averaged action
+    /// remains the single shared last-action feedback for both branches.
+    pub fn configure_symmetric_calf(&mut self, weight: f64, vx_gain: f64) -> Result<(), String> {
+        if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+            return Err("symmetric calf weight must be in [0, 1]".into());
+        }
+        if !vx_gain.is_finite() || vx_gain <= 0.0 {
+            return Err("GRU vx gain must be positive and finite".into());
+        }
+        self.symmetric_calf_weight = weight;
+        self.policy_vx_gain = vx_gain;
+        Ok(())
     }
 
     /// True when the host must supply the body-velocity estimate itself
@@ -218,6 +272,7 @@ impl PureGruController {
     pub fn reset(&mut self) {
         self.last_action = [0.0; N_ACT];
         self.hidden = vec![0.0; N_HIDDEN_GRU];
+        self.reflected_hidden = vec![0.0; N_HIDDEN_GRU];
         if let VelocitySource::Estimator(e) = &mut self.velocity {
             e.reset();
         }
@@ -277,7 +332,15 @@ impl PureGruController {
         cmd_raw: [f64; 3],
         vel_body_host: [f64; 3],
     ) -> Result<PolicyTick, String> {
-        let cmd = clamp_gru_cmd(cmd_raw);
+        // Low-speed diagnostic calibration only: fade to the trained command
+        // above 0.6 m/s so a 0.6 target is not sent as 0.7 to the actor.
+        let gain_fraction = ((0.6 - cmd_raw[0]) / 0.3).clamp(0.0, 1.0);
+        let vx_gain = if cmd_raw[0] > 0.0 {
+            1.0 + (self.policy_vx_gain - 1.0) * gain_fraction
+        } else {
+            1.0
+        };
+        let cmd = clamp_gru_cmd([cmd_raw[0] * vx_gain, cmd_raw[1], cmd_raw[2]]);
         let mut obs = build_base_obs(inp, &cmd, &self.default_isaac);
         let anomalies = obs_anomalies(&obs); // screen the 37-d base
         for a in self.last_action.iter() {
@@ -292,12 +355,27 @@ impl PureGruController {
         for v in vel.iter() {
             obs.push(*v as f32);
         }
-        let (action, hidden) = self.policy.infer(&obs, &self.hidden)?;
+        let (mut action, hidden) = self.policy.infer(&obs, &self.hidden)?;
+        let reflected_next = if self.symmetric_calf_weight > 0.0 {
+            let reflected_obs = reflect_observation(&obs);
+            let (reflected_action, reflected_hidden) =
+                self.policy.infer(&reflected_obs, &self.reflected_hidden)?;
+            let unreflected = reflect_action(&reflected_action);
+            for i in 8..12 {
+                action[i] += self.symmetric_calf_weight * (unreflected[i] - action[i]);
+            }
+            Some(reflected_hidden)
+        } else {
+            None
+        };
         let mut raw = [0.0f64; N_ACT];
         raw.copy_from_slice(&action);
         let (q, kp, kd) = decode_pure(&raw, &self.default_isaac);
         self.last_action = raw;
         self.hidden = hidden;
+        if let Some(h) = reflected_next {
+            self.reflected_hidden = h;
+        }
         self.last_obs = obs;
         self.vel_used = vel;
         self.q_hold = q;
@@ -324,6 +402,33 @@ mod tests {
         assert_eq!(clamp_gru_cmd([9.0, 9.0, 9.0]), [2.0, 0.0, 0.80]);
         assert_eq!(clamp_gru_cmd([-9.0, -9.0, -9.0]), [-0.16, 0.0, -0.80]);
         assert_eq!(clamp_gru_cmd([0.5, 0.2, 0.1]), [0.5, 0.0, 0.1]);
+    }
+
+    #[test]
+    fn sagittal_reflection_matches_the_python_contract() {
+        let obs: Vec<f32> = (0..N_OBS_GRU).map(|i| i as f32).collect();
+        let reflected = reflect_observation(&obs);
+        assert_eq!(reflected[1], -1.0); // command vy
+        assert_eq!(reflected[2], -2.0); // yaw command
+        assert_eq!(reflected[4], -4.0); // quaternion x
+        assert_eq!(reflected[6], -6.0); // quaternion z
+        assert_eq!(reflected[13], -14.0); // FL hip <- -FR hip
+        assert_eq!(reflected[17], 18.0); // FL thigh <- FR thigh
+        assert_eq!(reflected[37], -38.0); // previous FL hip action
+        assert_eq!(reflected[74], -74.0); // body vy
+        let act: Vec<f64> = (0..N_ACT).map(|i| i as f64).collect();
+        let reflected_act = reflect_action(&act);
+        assert_eq!(reflected_act[0], -1.0);
+        assert_eq!(reflected_act[8], 9.0);
+        assert_eq!(reflected_act[12], 13.0); // Kp swaps but does not change sign
+    }
+
+    #[test]
+    fn sagittal_reflection_is_involutive() {
+        let action: Vec<f64> = (0..N_ACT).map(|i| i as f64 - 10.0).collect();
+        assert_eq!(reflect_action(&reflect_action(&action)), action.as_slice());
+        let obs: Vec<f32> = (0..N_OBS_GRU).map(|i| i as f32 - 20.0).collect();
+        assert_eq!(reflect_observation(&reflect_observation(&obs)), obs);
     }
 
     /// Startup fills all six slots with the current frame; later frames
