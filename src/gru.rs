@@ -172,6 +172,18 @@ pub enum VelocitySource {
     Host,
 }
 
+/// How much to subtract from the estimator's vx this tick.
+///
+/// Zero unless a motion is commanded: standing, the correction tells the actor
+/// it is drifting backwards and it creeps forward. The gate is the gait's own.
+fn estimator_vx_correction(bias: f64, cmd_raw: [f64; 3]) -> f64 {
+    if bias != 0.0 && cmd_raw[0].abs() + cmd_raw[1].abs() + 0.3 * cmd_raw[2].abs() > 0.03 {
+        bias
+    } else {
+        0.0
+    }
+}
+
 pub struct PureGruController {
     policy: RecurrentOnnxPolicy,
     velocity: VelocitySource,
@@ -183,6 +195,9 @@ pub struct PureGruController {
     reflected_hidden: Vec<f32>,
     symmetric_calf_weight: f64,
     policy_vx_gain: f64,
+    /// Additive correction subtracted from the estimator's vx before it reaches
+    /// the actor, while a motion is commanded. See `set_estimator_vx_bias`.
+    estimator_vx_bias: f64,
     q_hold: [f64; 12],
     kp_hold: [f64; 12],
     kd_hold: [f64; 12],
@@ -225,6 +240,7 @@ impl PureGruController {
             reflected_hidden: vec![0.0; N_HIDDEN_GRU],
             symmetric_calf_weight: 0.0,
             policy_vx_gain: 1.0,
+            estimator_vx_bias: 0.0,
             q_hold: default_isaac,
             kp_hold: [PURE_KP.g0; 12],
             kd_hold: [PURE_KD.g0; 12],
@@ -237,6 +253,36 @@ impl PureGruController {
     /// Diagnostic only: average the four calf-position raw actions with an
     /// independently recurrent mirrored actor. The executed averaged action
     /// remains the single shared last-action feedback for both branches.
+    /// Subtract a measured constant from the estimator's vx while moving.
+    ///
+    /// The frozen estimator over-reads forward speed on plants other than the
+    /// one it was fitted on. Measured on the MuJoCo plants it is an OFFSET, not
+    /// a gain: standing perfectly still it already reports +0.062..+0.076 m/s
+    /// across three plants, so a multiplicative correction cannot remove it.
+    /// Subtracting 0.069 lifts 0.3 m/s tracking from 86% to 91% and 0.2 m/s
+    /// from 69% to 76%, on every plant and both checkpoints tested, with the
+    /// same tilt (go2_rl `doc/gru_estimator_bias_correction.md`).
+    ///
+    /// The actor believes the estimate, so this is a plant calibration, not a
+    /// second compensation of something the policy learned: the same estimator
+    /// is near-unbiased in Isaac, where the policy already tracks 95%.
+    /// **Measure it on the real robot by standing still and reading the
+    /// estimator** — the value here is the MuJoCo one.
+    ///
+    /// Applied only while a motion is commanded. Standing, the correction tells
+    /// the actor it is drifting backwards and it creeps forward (69 -> 123 mm
+    /// over 15 s measured), which is why the gate matches the gait's own.
+    pub fn set_estimator_vx_bias(&mut self, bias: f64) -> Result<(), String> {
+        if !bias.is_finite() {
+            return Err(format!("estimator vx bias must be finite, got {bias}"));
+        }
+        if bias.abs() > 0.5 {
+            return Err(format!("estimator vx bias {bias} is implausibly large (> 0.5 m/s)"));
+        }
+        self.estimator_vx_bias = bias;
+        Ok(())
+    }
+
     pub fn configure_symmetric_calf(&mut self, weight: f64, vx_gain: f64) -> Result<(), String> {
         if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
             return Err("symmetric calf weight must be in [0, 1]".into());
@@ -348,10 +394,11 @@ impl PureGruController {
         }
         // The estimator reads the 73-d prefix (base + feedback) — the
         // velocity slot is what it produces, so it is appended after.
-        let vel = match &mut self.velocity {
+        let mut vel = match &mut self.velocity {
             VelocitySource::Estimator(e) => e.estimate(&obs[..VEL_FEATURES])?,
             VelocitySource::Host => vel_body_host,
         };
+        vel[0] -= estimator_vx_correction(self.estimator_vx_bias, cmd_raw);
         for v in vel.iter() {
             obs.push(*v as f32);
         }
@@ -460,5 +507,35 @@ mod tests {
         let expect: Vec<f32> = (2..=VEL_FRAMES + 1).map(|k| k as f32).collect();
         let got: Vec<f32> = ring.iter().map(|f| f[0]).collect();
         assert_eq!(got, expect);
+    }
+}
+
+#[cfg(test)]
+mod estimator_bias_tests {
+    use super::*;
+
+    /// The correction applies only while a motion is commanded, and matches
+    /// the gait's own gate (|vx| + |vy| + 0.3|wz| > 0.03).
+    #[test]
+    fn correction_is_gated_on_a_commanded_motion() {
+        let b = 0.069;
+        assert_eq!(estimator_vx_correction(b, [0.0, 0.0, 0.0]), 0.0);
+        assert_eq!(estimator_vx_correction(b, [0.02, 0.0, 0.0]), 0.0);
+        assert_eq!(estimator_vx_correction(b, [0.0, 0.0, 0.09]), 0.0);
+        assert_eq!(estimator_vx_correction(b, [0.3, 0.0, 0.0]), b);
+        assert_eq!(estimator_vx_correction(b, [-0.1, 0.0, 0.0]), b);
+        assert_eq!(estimator_vx_correction(b, [0.0, 0.0, 0.4]), b);
+        assert_eq!(estimator_vx_correction(0.0, [1.0, 0.0, 0.0]), 0.0);
+    }
+
+    /// A plausible measured offset shifts vx by exactly that much; the
+    /// correction never changes sign with the command direction.
+    #[test]
+    fn correction_is_the_measured_offset_itself() {
+        // The three MuJoCo plants read +0.062..+0.076 m/s standing still.
+        for b in [0.062, 0.069, 0.076] {
+            assert_eq!(estimator_vx_correction(b, [0.3, 0.0, 0.0]), b);
+            assert_eq!(estimator_vx_correction(b, [-0.12, 0.0, 0.0]), b);
+        }
     }
 }
