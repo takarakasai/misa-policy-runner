@@ -15,7 +15,7 @@
 # misa-runner を束ねる。
 [package]
 name = "misa-policy-runner"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Takara Kasai <takara.kasai@gmail.com>"]

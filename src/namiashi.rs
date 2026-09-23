@@ -84,19 +84,22 @@ pub struct RefGaitCfg {
     /// 前進（vx > 0）だけのストライド較正利得（v16。後退・vy には掛けない —
     /// open-loop 実測で前進 50% / 後退 123% の非対称のため）。
     pub sg_fwd: f64,
+    /// 後退（vx < 0）だけのストライド較正利得（v24。open-loop で後退は 123%
+    /// 過剰なので 0.78 で割り戻す）。v12〜v16 は 1.0。
+    pub sg_back: f64,
 }
 
 impl RefGaitCfg {
     /// v12〜v14 のチェックポイント（旋回モーフ + 残差ゲート）。
     pub fn v12() -> Self {
         Self { yg_walk: 2.0, yg_turn: 8.0, turn_duty: 0.50, turn_lift_m: 0.060,
-               residual_rad: RESIDUAL_RAD, turn_residual_rad: TURN_RESIDUAL_RAD, sg_fwd: 1.0 }
+               residual_rad: RESIDUAL_RAD, turn_residual_rad: TURN_RESIDUAL_RAD, sg_fwd: 1.0, sg_back: 1.0 }
     }
 
     /// v15（種較正）: morph 無し・一様 yg 1.25・一様残差 0.08。
     pub fn v15() -> Self {
         Self { yg_walk: 1.25, yg_turn: 1.25, turn_duty: 0.60, turn_lift_m: 0.038,
-               residual_rad: RESIDUAL_RAD, turn_residual_rad: RESIDUAL_RAD, sg_fwd: 1.0 }
+               residual_rad: RESIDUAL_RAD, turn_residual_rad: RESIDUAL_RAD, sg_fwd: 1.0, sg_back: 1.0 }
     }
 
     /// v16（前進ストライド較正）: v15 + 前進のみ sg 1.4。デプロイ標準 =
@@ -105,6 +108,15 @@ impl RefGaitCfg {
     /// ヨー 102%、Isaac 決定論リセット 1/48）。
     pub fn v16() -> Self {
         Self { sg_fwd: 1.4, ..Self::v15() }
+    }
+
+    /// v24（後退の 3 段設計 + 較正、ゼロ学習・正規化あり系譜）: v15 +
+    /// sg_fwd 1.25 / sg_back 0.78。実機比較の第 2 候補 =
+    /// `2026-09-23_20-12-21_v24_long_s103/exported/policy_5500.onnx`
+    /// （MuJoCo 前進 96–104% / 後退 109/103% / 傾き 3–4°、go2_rl
+    /// doc/namiashi_policy_architecture.md §15）。デプロイ標準は v16 のまま。
+    pub fn v24() -> Self {
+        Self { sg_fwd: 1.25, sg_back: 0.78, ..Self::v15() }
     }
 
     /// 残差振幅 [rad]: wz でゲート（両端が同値なら定数）。
@@ -195,7 +207,7 @@ pub fn trot_target_cfg(tau: f64, cmd: [f64; 3], g: &RefGaitCfg) -> [f64; 12] {
         let swing = phase >= duty;
         let profile = if swing { blend - 0.5 } else { 0.5 - phase / duty };
         let nom = FEET_NOMINAL[l];
-        let sgx = if cmd[0] > 0.0 { g.sg_fwd } else { 1.0 };
+        let sgx = if cmd[0] > 0.0 { g.sg_fwd } else if cmd[0] < 0.0 { g.sg_back } else { 1.0 };
         let ux = sgx * cmd[0] - yg * cmd[2] * nom[1];
         let uy = cmd[1] + yg * cmd[2] * nom[0];
         let s = (std::f64::consts::PI * u).sin();
