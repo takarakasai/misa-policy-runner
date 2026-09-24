@@ -40,6 +40,12 @@ pub struct HeadingServo {
     /// 「移動中」とみなす平面指令の大きさ [m/s]。低速機（namiashi 0.1–0.3
     /// m/s）では既定 0.05 のままでよい。
     pub moving_threshold: f64,
+    /// これ未満の |wz| 指令のときだけ補正する [rad/s]。既定
+    /// [`HeadingServo::STRAIGHT_WZ`] = 0.05（直進だけ）。**大きくすると旋回中も
+    /// 補正する**: 参照は ∫wz_cmd を積んでいるので「指令どおりの角速度で回る」
+    /// 向きに働き、旋回の過不足と複合指令でのヨー偏りを同時に直せる。
+    /// 代償は姿勢の乱れ（Go2 では傾き 2.7 → 4.1°）。
+    pub straight_wz: f64,
     reference: Option<f64>,
     integral: f64,
     last_corr: f64,
@@ -59,6 +65,7 @@ impl HeadingServo {
             ki,
             clip: 0.30,
             moving_threshold: 0.05,
+            straight_wz: Self::STRAIGHT_WZ,
             reference: None,
             integral: 0.0,
             last_corr: 0.0,
@@ -78,15 +85,18 @@ impl HeadingServo {
             self.last_corr = 0.0;
         }
         self.was_moving = moving;
-        let mut reference = self.reference.unwrap() + user[2] * dt;
+        // **誤差を取ってから参照を進める。** 逆順だと旋回中は常に wz·dt
+        // （0.3 rad/s なら 6 mrad）だけ遅れて見え、指令どおり回っていても
+        // 積分が溜まり続ける（straight_wz を上げた途端に出る）。
+        let mut reference = self.reference.unwrap();
         let mut err = wrap_pi(yaw - reference);
         if err.abs() > Self::RESET_ERR_RAD {
             reference = yaw;
             err = 0.0;
             self.integral = 0.0;
         }
-        self.reference = Some(wrap_pi(reference));
-        let straight = moving && user[2].abs() < Self::STRAIGHT_WZ;
+        self.reference = Some(wrap_pi(reference + user[2] * dt));
+        let straight = moving && user[2].abs() < self.straight_wz;
         let unclipped = self.last_corr.abs() < self.clip - 1.0e-9;
         if straight && unclipped {
             self.integral += err * dt;
@@ -144,7 +154,34 @@ mod tests {
         assert!((applied[2] - (-bias)).abs() < 0.01, "corr {:.4}", applied[2]);
     }
 
-    /// 旋回指令中は補正せず、参照だけが指令を積む。
+    /// straight_wz を上げると旋回中も補正する（参照は ∫wz_cmd を積むので
+    /// 「指令どおりに回る」向き）。指令と実測が一致していれば補正は 0。
+    #[test]
+    fn raising_straight_wz_corrects_during_turns() {
+        let dt = 0.02;
+        let mut sv = HeadingServo::new(2.0, 0.5);
+        sv.straight_wz = 1.0;
+        let mut yaw = 0.0;
+        // 指令 0.3 に対し実測 0.24（80% 追従）→ 不足ぶんを補う正の補正が出る。
+        let mut last = [0.0; 3];
+        for _ in 0..250 {
+            last = sv.apply(yaw, [0.2, 0.0, 0.3], dt);
+            yaw += 0.24 * dt;
+        }
+        assert!(last[2] > 0.3, "旋回の不足を補えていない: {:.3}", last[2]);
+        // 指令どおり回っている個体では補正はほぼ 0。
+        let mut sv2 = HeadingServo::new(2.0, 0.5);
+        sv2.straight_wz = 1.0;
+        let mut y2 = 0.0;
+        let mut l2 = [0.0; 3];
+        for _ in 0..250 {
+            l2 = sv2.apply(y2, [0.2, 0.0, 0.3], dt);
+            y2 += 0.3 * dt;
+        }
+        assert!((l2[2] - 0.3).abs() < 0.01, "指令どおりなのに補正が出た: {:.3}", l2[2]);
+    }
+
+    /// 既定（straight_wz 0.05）では旋回指令中は補正せず、参照だけが指令を積む。
     #[test]
     fn turning_is_never_fought() {
         let dt = 0.02;
