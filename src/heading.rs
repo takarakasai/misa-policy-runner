@@ -37,8 +37,12 @@ pub struct HeadingServo {
     pub ki: f64,
     /// 補正の上限 [rad/s]。学習した wz 分布の一部に収めること。
     pub clip: f64,
-    /// 「移動中」とみなす平面指令の大きさ [m/s]。低速機（namiashi 0.1–0.3
-    /// m/s）では既定 0.05 のままでよい。
+    /// 「移動中」とみなす指令の大きさ（平面 [m/s]、ヨーは同じ数値を [rad/s]
+    /// として使う）。低速機（namiashi 0.1–0.3 m/s）では既定 0.05 のままでよい。
+    ///
+    /// **その場旋回も「移動」に含める** — 操縦者が動きを指令している状態だから。
+    /// 既定（`straight_wz` 0.05）では旋回中は補正しないので挙動は変わらず、
+    /// `straight_wz` を上げたときだけ「その場旋回の追従も直す」に効く。
     pub moving_threshold: f64,
     /// これ未満の |wz| 指令のときだけ補正する [rad/s]。既定
     /// [`HeadingServo::STRAIGHT_WZ`] = 0.05（直進だけ）。**大きくすると旋回中も
@@ -78,7 +82,9 @@ impl HeadingServo {
 
     /// 1 tick 進めて、サーボ込みの目標指令 `[vx, vy, wz]` を返す。
     pub fn apply(&mut self, yaw: f64, user: [f64; 3], dt: f64) -> [f64; 3] {
-        let moving = user[0].abs() >= self.moving_threshold || user[1].abs() >= self.moving_threshold;
+        let moving = user[0].abs() >= self.moving_threshold
+            || user[1].abs() >= self.moving_threshold
+            || user[2].abs() >= self.moving_threshold;
         if self.reference.is_none() || (moving && !self.was_moving) {
             self.reference = Some(yaw);
             self.integral = 0.0;
@@ -169,6 +175,16 @@ mod tests {
             yaw += 0.24 * dt;
         }
         assert!(last[2] > 0.3, "旋回の不足を補えていない: {:.3}", last[2]);
+        // その場旋回（平面指令なし）でも補正が出る。
+        let mut sv3 = HeadingServo::new(2.0, 0.5);
+        sv3.straight_wz = 1.0;
+        let mut y3 = 0.0;
+        let mut l3 = [0.0; 3];
+        for _ in 0..250 {
+            l3 = sv3.apply(y3, [0.0, 0.0, 0.4], dt);
+            y3 += 0.46 * dt; // 116% の過追従
+        }
+        assert!(l3[2] < 0.4, "その場旋回の過剰を抑えられていない: {:.3}", l3[2]);
         // 指令どおり回っている個体では補正はほぼ 0。
         let mut sv2 = HeadingServo::new(2.0, 0.5);
         sv2.straight_wz = 1.0;
