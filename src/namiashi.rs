@@ -102,7 +102,8 @@ impl RefGaitCfg {
                residual_rad: RESIDUAL_RAD, turn_residual_rad: RESIDUAL_RAD, sg_fwd: 1.0, sg_back: 1.0 }
     }
 
-    /// v16（前進ストライド較正）: v15 + 前進のみ sg 1.4。デプロイ標準 =
+    /// v16（前進ストライド較正）: v15 + 前進のみ sg 1.4。**2026-09-25 に v24 へ
+    /// 標準を譲った**（[`RefGaitCfg::v24`]）。対照用 =
     /// `2026-09-19_01-11-02_v16_sgfwd/exported/policy_4598.onnx`
     /// （MuJoCo 前進 99–107% / 後退 75% / 旋回 105–108% / 複合 vx 109%・
     /// ヨー 102%、Isaac 決定論リセット 1/48）。
@@ -111,10 +112,12 @@ impl RefGaitCfg {
     }
 
     /// v24（後退の 3 段設計 + 較正、ゼロ学習・正規化あり系譜）: v15 +
-    /// sg_fwd 1.25 / sg_back 0.78。実機比較の第 2 候補 =
-    /// `2026-09-23_20-12-21_v24_long_s103/exported/policy_5500.onnx`
-    /// （MuJoCo 前進 96–104% / 後退 109/103% / 傾き 3–4°、go2_rl
-    /// doc/namiashi_policy_architecture.md §15）。デプロイ標準は v16 のまま。
+    /// sg_fwd 1.25 / sg_back 0.78。**デプロイ標準（2026-09-25〜）** =
+    /// `2026-09-23_20-12-21_v24_long_s103/exported/policy_5500.onnx`。
+    /// 体座標メトリクス + 方位サーボ（[`crate::heading`]、旋回中も補正）の
+    /// Rust sim 25 ケースで v16 を全軸で上回る: 平均 |追従誤差| 5.1pt 対
+    /// 11.2pt、最大傾き 4.5° 対 6.0°、後退 105–111% 対 71–72%、旋回・複合
+    /// ヨー 100%、転倒 0（go2_rl doc/namiashi_policy_architecture.md §18）。
     pub fn v24() -> Self {
         Self { sg_fwd: 1.25, sg_back: 0.78, ..Self::v15() }
     }
