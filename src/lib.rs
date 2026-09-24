@@ -30,6 +30,7 @@
 pub mod controller;
 pub mod go2;
 pub mod gru;
+pub mod heading;
 pub mod namiashi;
 pub mod namiashi_ref;
 pub mod natural;
