@@ -27,6 +27,7 @@
 //! torque from the held targets every tick and re-evaluates
 //! [`controller::NaturalController::support_torque`].
 
+pub mod blind;
 pub mod controller;
 pub mod go2;
 pub mod gru;
@@ -39,6 +40,7 @@ pub mod policy;
 pub mod pure;
 pub mod support;
 
+pub use blind::{clamp_blind_cmd, BlindController};
 pub use controller::{decode_loco, NaturalController, PolicyTick};
 pub use gru::{clamp_gru_cmd, HistoryVelocityEstimator, PureGruController, VelocitySource};
 pub use pure::{clamp_pure_cmd, PureController};
