@@ -127,6 +127,39 @@ impl BlindController {
         self.t = 0.0;
     }
 
+    /// 直近の行動（観測の `last_action` 項に入るもの）。
+    ///
+    /// **方策を切り替えるときに引き継ぐために公開している。** 同じ契約の
+    /// 方策を 2 本持って用途で切り替える場合（段差用と平地省エネ用など）、
+    /// 新しい方を素の `reset()` で始めると `last_action` が 0 になり、
+    /// **新しい方策は「直前に何もしていない」という嘘の観測を見る**。
+    /// 歩いている最中の切り替えでそれをやると分布外の入力になるので、
+    /// 出ていく方の値を [`Self::adopt_state`] で渡す。
+    pub fn last_action(&self) -> [f64; N_ACT_BLIND] {
+        self.last_action
+    }
+
+    /// 保持している関節目標（凍結時に出すもの）。切り替えの引き継ぎ用。
+    pub fn q_hold_isaac(&self) -> [f64; 12] {
+        self.q_hold
+    }
+
+    /// 別の方策から状態を引き継いで、**歩行の途中から**走り始める。
+    ///
+    /// `reset()` との違いは「記憶を消さない」こと。切り替えの瞬間に
+    /// 観測（`last_action`）と出力（`q_hold`）が連続になるので、
+    /// 段差用 ⇄ 平地省エネ用のような**同じ契約の方策どうしの入れ替え**を
+    /// 走行中にできる。履歴フレームは持っていない（契約が 48·1 のとき）か、
+    /// 新しい方策の初回 tick で埋め直される。
+    ///
+    /// **契約が違う方策には使えない**（観測の次元や意味が違う）。
+    pub fn adopt_state(&mut self, last_action: [f64; N_ACT_BLIND], q_hold_isaac: [f64; 12]) {
+        self.frames.clear();
+        self.last_action = last_action;
+        self.q_hold = q_hold_isaac;
+        self.t = 0.0;
+    }
+
     /// 安全側の保持: 直近の指令をそのまま出す（凍結しても連続）。
     pub fn hold(&self) -> PolicyTick {
         PolicyTick {
@@ -376,5 +409,42 @@ mod tests {
         let far = DEFAULT_LOCO_ISAAC[8] + BLIND_POS_SCALE * (-8.0);
         assert!(far < -3.0, "クランプされていたら -3 より大きい: {far}");
         assert_eq!((BLIND_KP, BLIND_KD), (25.0, 0.5));
+    }
+
+    /// `build_blind_frame` の `last_action` 項は引き継いだ値を映す。
+    ///
+    /// **方策の切り替えで引き継がないと、新しい方策は「直前に何もしていない」
+    /// という嘘の観測を見る。** 走行中の切り替えではそれが分布外の入力になる。
+    #[test]
+    fn a_handed_over_last_action_shows_up_in_the_observation() {
+        let inp = ObsInput {
+            quat_wxyz: [1.0, 0.0, 0.0, 0.0],
+            gyro_rad_s: [0.0; 3],
+            accel_m_s2: [0.0, 0.0, 9.81],
+            joint_q_go2: [0.0; 12],
+            joint_dq_go2: [0.0; 12],
+            ..Default::default()
+        };
+        let mut handed = [0.0f64; N_ACT_BLIND];
+        handed[0] = 0.75;
+        handed[11] = -1.25;
+        let f = build_blind_frame(&inp, &[0.0; 3], [0.0; 3], &handed);
+        // 観測の並びは 速度3|ジャイロ3|重力3|指令3|関節角12|関節速度12|前回行動12。
+        assert!((f[36] - 0.75).abs() < 1e-6, "先頭の前回行動: {}", f[36]);
+        assert!((f[47] + 1.25).abs() < 1e-6, "末尾の前回行動: {}", f[47]);
+        // 引き継がない（ゼロ）場合と区別がつくこと。
+        let z = build_blind_frame(&inp, &[0.0; 3], [0.0; 3], &[0.0; N_ACT_BLIND]);
+        assert_ne!(f[36], z[36]);
+    }
+
+    /// 引き継ぐ値は**既定姿勢・ゼロ行動とは区別がつく**こと。
+    /// （`adopt_state` 自体の往復は ONNX を要するので `examples/blind_parity` 側で見る）
+    #[test]
+    fn handover_values_are_distinguishable_from_a_fresh_reset() {
+        let mut a = [0.0f64; N_ACT_BLIND];
+        a[3] = 0.5;
+        let q = [0.1f64; 12];
+        assert_ne!(a, [0.0; N_ACT_BLIND], "ゼロ行動と区別がつくこと");
+        assert_ne!(q, DEFAULT_LOCO_ISAAC, "既定姿勢と区別がつくこと");
     }
 }
